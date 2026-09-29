@@ -17,7 +17,6 @@ public static class Program
     {
         public string Id;
         public string Name;
-        public string SectionId;
     }
 
     sealed class SectionRef
@@ -274,8 +273,7 @@ Notes:
                     sec.Pages.Add(new PageRef
                     {
                         Id = TextRunExtractor.Attr(pg, "ID"),
-                        Name = TextRunExtractor.Attr(pg, "name"),
-                        SectionId = sec.Id
+                        Name = TextRunExtractor.Attr(pg, "name")
                     });
                 }
                 nb.Sections.Add(sec);
@@ -328,16 +326,15 @@ Notes:
                     string assetsDir = _noImages ? null : Path.Combine(secDir, "assets");
                     if (!_dryRun) Directory.CreateDirectory(secDir);
 
-                    // One converter (and one assets folder) per section. Image
-                    // names are prefixed with the page's position in the section
-                    // so that pages can never overwrite each other's images.
+                    // One converter and one assets folder per section. Image names
+                    // carry the page's position so pages cannot overwrite each
+                    // other's images.
                     int pageOrdinal = 0;
                     OneNoteConverter conv = new OneNoteConverter(assetsDir,
                         MakeAssetNameFor(() => pageOrdinal));
 
-                    // OneNote happily allows duplicate page titles inside a
-                    // section, so filenames are de-duplicated per section to
-                    // make sure no page silently overwrites another.
+                    // Duplicate page titles are legal, so file names are
+                    // de-duplicated per section to avoid losing a page.
                     HashSet<string> usedStems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
                     int n = 0;
@@ -378,6 +375,7 @@ Notes:
                                 continue;
                             }
 
+                            conv.ResetImages();
                             string md = conv.ConvertPage(pageXml, title);
                             md = BuildFrontMatter(page, nb, sec) + md;
 
@@ -445,7 +443,8 @@ Notes:
                  .Replace("*", "%2A");
     }
 
-    static Func<string, int, string> MakeAssetNameFor(Func<int> pageOrdinal)    {
+    static Func<string, int, string> MakeAssetNameFor(Func<int> pageOrdinal)
+    {
         return delegate (string format, int index)
         {
             string ext = (format ?? "png").Trim().ToLowerInvariant();

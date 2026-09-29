@@ -9,11 +9,13 @@
 .EXAMPLE
   .\Export-OneNoteMarkdown.ps1 -List
 .EXAMPLE
-  .\Export-OneNoteMarkdown.ps1 -OutputDir D:\notes -Notebook KLG
+  .\Export-OneNoteMarkdown.ps1 -OutputDir D:\notes -Notebook Reports
 #>
 [CmdletBinding()]
 param(
-    [string]   $OutputDir   = "onenote-export",
+    # Defaults to a path outside the repository so a stray run cannot leave
+    # private notebook content inside the project tree.
+    [string]   $OutputDir   = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'onenote-export'),
     [string]   $Notebook,
     [string]   $Section,
     [switch]   $List,
@@ -31,13 +33,13 @@ if (-not (Test-Path $exe)) {
     if ($LASTEXITCODE -ne 0) { throw "build.cmd failed" }
 }
 
-$args = @($OutputDir)
-if ($Notebook)      { $args += @('--notebook', $Notebook) }
-if ($Section)       { $args += @('--section',  $Section)  }
-if ($List)          { $args += '--list' }
-if ($NoImages)      { $args += '--no-images' }
-if ($SkipExisting)  { $args += '--skip-existing' }
-if ($DryRun)        { $args += '--dry-run' }
+$argList = @($OutputDir)
+if ($Notebook)      { $argList += @('--notebook', $Notebook) }
+if ($Section)       { $argList += @('--section',  $Section)  }
+if ($List)          { $argList += '--list' }
+if ($NoImages)      { $argList += '--no-images' }
+if ($SkipExisting)  { $argList += '--skip-existing' }
+if ($DryRun)        { $argList += '--dry-run' }
 
-& $exe @args
+& $exe @argList
 exit $LASTEXITCODE

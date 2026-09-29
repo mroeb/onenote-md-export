@@ -1,16 +1,14 @@
 using System;
-using System.Collections.Generic;
-using System.Globalization;
 using System.Text;
 
-// Extracts inline formatting runs from a OneNote <one:T> node.
+// Renders a <one:T> node, which holds either plain CDATA or <one:r> runs
+// that carry per-run formatting.
 public sealed class TextRunExtractor
 {
     public StringBuilder Out = new StringBuilder();
 
     public void Extract(System.Xml.XmlNode tNode)
     {
-        // <one:T> holds CDATA (plain text) or child <one:r> runs (formatted).
         foreach (System.Xml.XmlNode child in tNode.ChildNodes)
         {
             if (child.NodeType == System.Xml.XmlNodeType.CDATA ||
@@ -37,6 +35,8 @@ public sealed class TextRunExtractor
                 hadBreak = true;
         }
 
+        if (text.Length == 0) return;
+
         string prefix = "", suffix = "";
         string style = Attr(run, "style");
         if (style != null)
@@ -46,18 +46,15 @@ public sealed class TextRunExtractor
             if (HasFlag(style, "text-decoration:underline") || HasFlag(style, "text-decoration:line-through")) { prefix = "<u>" + prefix; suffix = suffix + "</u>"; }
         }
 
-        if (text.Length == 0) return;
-        text = OneNoteConverter.DecodeEntities(text);
         Out.Append(prefix);
-        Out.Append(text);
+        Out.Append(OneNoteConverter.DecodeEntities(text));
         Out.Append(suffix);
         if (hadBreak) Out.Append("  \n");
     }
 
-    public static bool HasFlag(string style, string token)
+    static bool HasFlag(string style, string token)
     {
-        if (style == null) return false;
-        return style.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0;
+        return style != null && style.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     public static string Attr(System.Xml.XmlNode n, string name)

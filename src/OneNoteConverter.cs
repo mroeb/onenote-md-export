@@ -17,6 +17,29 @@ public sealed class OneNoteConverter
     // Maps quickStyleIndex -> style name (e.g. "h2", "p", "cite")
     readonly Dictionary<int, string> _styleNames = new Dictionary<int, string>();
 
+    // Objects already rendered during the normal walk. Keyed by node reference
+    // so the post-pass can tell "handled" from "missed".
+    readonly List<XmlNode> _emitted = new List<XmlNode>();
+
+    // Attachment file names already used in the current section's assets
+    // folder, de-duplicated so two attachments of the same name cannot
+    // overwrite each other.
+    readonly HashSet<string> _usedAttachmentNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    int _attachmentCounter;
+
+    /// <summary>
+    /// Clears per-page state. The converter is shared by every page in a
+    /// section (they share one assets folder), so this keeps image numbering
+    /// starting at 1 for each page and stops the emitted list from growing
+    /// across the whole section. Attachment names deliberately survive, since
+    /// they must stay unique for the whole section.
+    /// </summary>
+    public void ResetImages()
+    {
+        _imageCounter = 0;
+        _emitted.Clear();
+    }
+
     public OneNoteConverter(string assetsDir, Func<string, int, string> assetNamer)
     {
         _assetsDir = assetsDir;
@@ -49,7 +72,55 @@ public sealed class OneNoteConverter
         foreach (XmlNode outline in doc.SelectNodes("/one:Page/one:Outline", ns))
             WriteOutline(outline, md, ns, 0);
 
+        // Images and attachments do not always sit inside an outline: OneNote
+        // also places them directly under <one:Page> (pinned/floating objects)
+        // and occasionally elsewhere. Anything the walk above did not emit is
+        // appended here in document order, so nothing is silently dropped.
+        AppendUnemitted(doc, md, ns);
+
         return md.ToString();
+    }
+
+    void AppendUnemitted(XmlDocument doc, StringBuilder md, XmlNamespaceManager ns)
+    {
+        // A single XPath returns both kinds in document order, which is both
+        // cheaper and simpler than collecting two lists and sorting afterwards.
+        XmlNodeList candidates = doc.SelectNodes("//*[local-name()='Image' or @preferredName]", ns);
+        if (candidates == null || candidates.Count == 0) return;
+
+        foreach (XmlNode node in candidates)
+        {
+            if (AlreadyEmitted(node)) continue;
+
+            if (node.LocalName == "Image")
+            {
+                // Callback-only or empty payloads are not recoverable; an empty
+                // <one:Data/> is a print artefact rather than a real picture.
+                XmlNode data = node.SelectSingleNode("one:Data", ns);
+                if (data == null || data.InnerText.Trim().Length == 0) continue;
+            }
+
+            string rendered = node.LocalName == "Image"
+                ? RenderImage(node, ns)
+                : RenderAttachment(node);
+
+            if (rendered.Length == 0) continue;      // renderers record it either way
+            if (!EndsWithBlankLine(md)) md.Append("\n");
+            md.Append(rendered).Append("\n\n");
+        }
+    }
+
+    static bool EndsWithBlankLine(StringBuilder md)
+    {
+        if (md.Length < 2) return false;
+        return md[md.Length - 1] == '\n' && md[md.Length - 2] == '\n';
+    }
+
+    bool AlreadyEmitted(XmlNode n)
+    {
+        for (int i = 0; i < _emitted.Count; i++)
+            if (ReferenceEquals(_emitted[i], n)) return true;
+        return false;
     }
 
     void LoadStyleNames(XmlDocument doc, XmlNamespaceManager ns)
@@ -103,8 +174,6 @@ public sealed class OneNoteConverter
 
         int level = HeadingLevel(styleName);
         bool isBullet = oe.SelectSingleNode("one:List", ns) != null;
-
-        // Indent for nested content
         string pad = new string(' ', depth * 2);
 
         if (level > 0)
@@ -141,7 +210,6 @@ public sealed class OneNoteConverter
             }
         }
 
-        // Recurse into children (sub-bullets, and anything else)
         XmlNode kids = oe.SelectSingleNode("one:OEChildren", ns);
         if (kids != null)
         {
@@ -188,6 +256,11 @@ public sealed class OneNoteConverter
                 case "Image":
                     sb.Append(RenderImage(node, ns));
                     break;
+                case "InsertedFile":
+                case "MediaFile":
+                case "File":
+                    sb.Append(RenderAttachment(node));
+                    break;
                 case "OEChildren":
                     break; // handled by caller
             }
@@ -216,9 +289,9 @@ public sealed class OneNoteConverter
     }
 
     /// <summary>
-    /// Resolves the HTML/XML entities OneNote leaves inside CDATA text
-    /// (&amp;nbsp;, &amp;#xA; and friends). "&amp;amp;" is resolved last so that
-    /// a literal "&amp;amp;lt;" cannot collapse all the way down to "&lt;".
+    /// Resolves the HTML/XML entities OneNote leaves inside CDATA text. Entities
+    /// are resolved left to right, so "&amp;lt;" becomes "&lt;" rather than
+    /// collapsing all the way down to "<".
     /// </summary>
     public static string DecodeEntities(string s)
     {
@@ -296,10 +369,9 @@ public sealed class OneNoteConverter
         return sb.ToString();
     }
 
-    // OneNote frequently stores a whole <one:T> as a literal HTML fragment that
-    // mixes plain text and markup, e.g. "Zielgruppe: <span ...>Auszubildende</span>."
-    // Such fragments are common enough that sniffing for any inline tag (not just
-    // one at the very start) is the reliable test.
+    // OneNote often stores a whole <one:T> as a literal HTML fragment that
+    // mixes plain text and markup, so the test is for any inline tag anywhere
+    // in the string rather than one at the very start.
     static readonly string[] HtmlTags =
     {
         "<span", "<b>", "<b ", "<i>", "<i ", "<em", "<font", "<a ", "<a>",
@@ -344,10 +416,13 @@ public sealed class OneNoteConverter
             string fname = _assetNamer(format, _imageCounter);
             Directory.CreateDirectory(_assetsDir);
             File.WriteAllBytes(Path.Combine(_assetsDir, fname), bytes);
+            _emitted.Add(img);
             return "![" + EscapeAlt(ShortAlt(alt)) + "](assets/" + fname + ")";
         }
         catch (Exception)
         {
+            // Mark as handled so the post-pass does not retry a broken payload.
+            _emitted.Add(img);
             return "";
         }
     }
@@ -396,10 +471,115 @@ public sealed class OneNoteConverter
         return sb.ToString();
     }
 
-    // OneNote stores some formatted runs as literal HTML inside <one:T>.
-    // Those fragments are frequently *not* well-formed XML (unclosed spans,
-    // stray entities), so this is a tolerant scanner rather than a DOM parse:
-    // it never throws and degrades to plain text instead of losing content.
+    /// <summary>
+    /// Renders an <one:InsertedFile> / <one:MediaFile> attachment. OneNote
+    /// keeps the bytes in its own cache and points at them with pathCache;
+    /// preferredName is the name the file had when it was attached, which is
+    /// what a reader expects to see.
+    /// </summary>
+    string RenderAttachment(XmlNode node)
+    {
+        _emitted.Add(node);
+
+        if (_assetsDir == null) return "";
+
+        string preferred = TextRunExtractor.Attr(node, "preferredName");
+        string cachePath = TextRunExtractor.Attr(node, "pathCache");
+
+        if (string.IsNullOrEmpty(preferred) && string.IsNullOrEmpty(cachePath))
+            return "";
+
+        _attachmentCounter++;
+        string ext = SafeExtension(preferred);
+        string baseName = SafeFileNameWithoutExtension(
+            string.IsNullOrEmpty(preferred) ? Path.GetFileName(cachePath) : preferred);
+
+        if (baseName.Length == 0)
+            baseName = "attachment-" + _attachmentCounter.ToString("D3");
+
+        // Guarantee a unique name within the section.
+        string candidate = baseName + ext;
+        int dup = 2;
+        while (!_usedAttachmentNames.Add(candidate))
+        {
+            candidate = baseName + " (" + dup.ToString(CultureInfo.InvariantCulture) + ")" + ext;
+            dup++;
+        }
+
+        string label = baseName + ext;
+        string sizeText = "";
+
+        if (!string.IsNullOrEmpty(cachePath) && File.Exists(cachePath))
+        {
+            try
+            {
+                string dest = Path.Combine(_assetsDir, candidate);
+                Directory.CreateDirectory(_assetsDir);
+                File.Copy(cachePath, dest, true);
+                sizeText = " (" + HumanSize(new FileInfo(dest).Length) + ")";
+            }
+            catch (Exception)
+            {
+                return "[" + EscapeLabel(label) + "] (attachment could not be copied)";
+            }
+        }
+        else
+        {
+            // Not synced to this machine yet, so the bytes are unavailable.
+            return "[" + EscapeLabel(label) + "] (not available locally)";
+        }
+
+        return "[" + EscapeLabel(label + sizeText) + "](assets/" + Uri.EscapeDataString(candidate)
+                 .Replace("(", "%28").Replace(")", "%29") + ")";
+    }
+
+    static string EscapeLabel(string s)
+    {
+        return s.Replace("[", "\\[").Replace("]", "\\]");
+    }
+
+    static string SafeExtension(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return "";
+        string ext = Path.GetExtension(name);
+        if (string.IsNullOrEmpty(ext) || ext.Length > 12) return "";
+        foreach (char c in ext)
+            if (!(char.IsLetterOrDigit(c) || c == '.')) return "";
+        return ext.ToLowerInvariant();
+    }
+
+    static string SafeFileNameWithoutExtension(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return "";
+        string stem = Path.GetFileNameWithoutExtension(name);
+        if (string.IsNullOrEmpty(stem)) stem = name;
+        var sb = new StringBuilder(stem.Length);
+        for (int i = 0; i < stem.Length; i++)
+        {
+            char c = stem[i];
+            bool bad = c < 32 || c == '/' || c == '\\' || c == ':' || c == '*' || c == '?'
+                       || c == '"' || c == '<' || c == '>' || c == '|' || c == '?';
+            sb.Append(bad ? '_' : c);
+        }
+        string r = sb.ToString().Trim().TrimEnd('.');
+        if (r.Length > 100) r = r.Substring(0, 100).TrimEnd();
+        return r;
+    }
+
+    static string HumanSize(long bytes)
+    {
+        if (bytes < 1024) return bytes + " B";
+        double kb = bytes / 1024.0;
+        if (kb < 1024) return kb.ToString("0.#", CultureInfo.InvariantCulture) + " KB";
+        double mb = kb / 1024.0;
+        if (mb < 1024) return mb.ToString("0.#", CultureInfo.InvariantCulture) + " MB";
+        return (mb / 1024.0).ToString("0.##", CultureInfo.InvariantCulture) + " GB";
+    }
+
+    // OneNote stores some formatted runs as literal HTML inside <one:T>. Those
+    // fragments are frequently not well-formed XML (unclosed tags, stray
+    // entities), so this is a tolerant scanner rather than a DOM parse: it
+    // never throws and degrades to plain text instead of losing content.
     string ConvertInlineHtml(string html)
     {
         if (string.IsNullOrEmpty(html)) return "";
@@ -571,20 +751,6 @@ public sealed class OneNoteConverter
             at += name.Length;
         }
         return null;
-    }
-
-    static string StripTags(string s)
-    {
-        int i = 0;
-        StringBuilder sb = new StringBuilder();
-        bool inTag = false;
-        for (; i < s.Length; i++)
-        {
-            if (s[i] == '<') inTag = true;
-            else if (s[i] == '>') inTag = false;
-            else if (!inTag) sb.Append(s[i]);
-        }
-        return sb.ToString();
     }
 
     // Converts a OneNote tableHTML blob into a GitHub-flavoured Markdown table.
